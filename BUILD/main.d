@@ -122,15 +122,15 @@ main.o: ../main.cpp ../mbed_config.h ../mbed/mbed.h \
  ../mbed/platform/mbed_wait_api.h ../mbed/hal/sleep_api.h \
  ../mbed/platform/mbed_sleep.h ../mbed/platform/mbed_rtc_time.h \
  ../mbed/platform/mbed_poll.h ../mbed/platform/ATCmdParser.h \
- ../mbed/mbed.h ../mbed/platform/FileSystemHandle.h \
- ../mbed/platform/DirHandle.h ../mbed/platform/FileHandle.h \
- ../mbed/platform/DirHandle.h ../mbed/platform/CriticalSectionLock.h \
- ../mbed/platform/DeepSleepLock.h ../mbed/platform/Callback.h \
- ../mbed/platform/FunctionPointer.h ../Crypto/hash/SHA256.h \
- ../Crypto/hash/HashAlgorithm.h ../Crypto/hash/SHA2_32.h \
- ../mbed/drivers/Timer.h ../mbed-rtos/rtos/rtos.h \
- ../mbed-rtos/rtos/Thread.h ../mbed-rtos/rtx/TARGET_CORTEX_M/cmsis_os.h \
- ../mbed/platform/toolchain.h ../mbed-rtos/rtos/Semaphore.h \
- ../mbed-rtos/rtos/Mutex.h ../mbed-rtos/rtos/RtosTimer.h \
- ../mbed-rtos/rtos/Mail.h ../mbed-rtos/rtos/MemoryPool.h \
- ../mbed-rtos/rtos/Queue.h ../mbed/platform/mbed_error.h
+ ../mbed/platform/FileSystemHandle.h ../mbed/platform/DirHandle.h \
+ ../mbed/platform/FileHandle.h ../mbed/platform/DirHandle.h \
+ ../mbed/platform/CriticalSectionLock.h ../mbed/platform/DeepSleepLock.h \
+ ../mbed/platform/Callback.h ../mbed/platform/FunctionPointer.h \
+ ../Crypto/hash/SHA256.h ../Crypto/hash/HashAlgorithm.h \
+ ../Crypto/hash/SHA2_32.h ../mbed/drivers/Timer.h \
+ ../mbed-rtos/rtos/rtos.h ../mbed-rtos/rtos/Thread.h \
+ ../mbed-rtos/rtx/TARGET_CORTEX_M/cmsis_os.h ../mbed/platform/toolchain.h \
+ ../mbed-rtos/rtos/Semaphore.h ../mbed-rtos/rtos/Mutex.h \
+ ../mbed-rtos/rtos/RtosTimer.h ../mbed-rtos/rtos/Mail.h \
+ ../mbed-rtos/rtos/MemoryPool.h ../mbed-rtos/rtos/Queue.h \
+ ../mbed/platform/mbed_error.h

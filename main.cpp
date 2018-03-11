@@ -1,4 +1,4 @@
-#include "mbed/mbed.h"
+#include "mbed.h"
 #include "SHA256.h"
 #include "Timer.h"
 #include "rtos.h"
@@ -52,11 +52,11 @@ InterruptIn I2(I2pin);
 InterruptIn I3(I3pin);
 
 //Motor Drive outputs
-DigitalOut L1L(L1Lpin);
+PwmOut L1L(L1Lpin);
 DigitalOut L1H(L1Hpin);
-DigitalOut L2L(L2Lpin);
+PwmOut L2L(L2Lpin);
 DigitalOut L2H(L2Hpin);
-DigitalOut L3L(L3Lpin);
+PwmOut L3L(L3Lpin);
 DigitalOut L3H(L3Hpin);
 
 // Function prototypes
@@ -64,12 +64,18 @@ void mine();
 void interrupt();
 inline int8_t readRotorState();
 int8_t motorHome();
-void motorOut(int8_t driveState, float duty);
+void motorOut(int8_t driveState, uint32_t torque);
 void setSpeed();
 void setPWMperiod(float period);
 void motorOff();
 void commOutFn();
 void putMessage(uint8_t code, uint32_t data);
+void serialISR();
+void commDecFn();
+void decodeR();
+void decodeV();
+void decodeK();
+void decodeT();
 // Define Threads
 
 // Declare global variables
@@ -81,43 +87,56 @@ Timer t2;
 int32_t targetSpeed = 0;
 float duty = 1;
 bool debugFlag = true;
-Thread commOutT;
+char inComm[30]; // Input command
+int inCommPtr = 0; // Pointer to the first empty position of the buff array
+//volatile uint64_t newKey = 0;
+volatile uint64_t newKey = 0;
+float PWMPeriod = 128;
+Mutex newKey_mutex;
+// Threads
+Thread commOutT = Thread(osPriorityNormal);
+Thread commDec = Thread(osPriorityNormal);// Command decode thread
+Thread minning = Thread(osPriorityNormal, 1024);
+
 typedef struct{
     uint8_t code;
     uint32_t data;
  } message_t ;
 Mail<message_t,16> outMessages;
+Queue<void, 8> inCharQ;
 
-Serial pc(SERIAL_TX, SERIAL_RX);
+RawSerial pc(SERIAL_TX, SERIAL_RX);
   
 //Main
 int main() {
     
     //Thread 
+    osThreadSetPriority(osThreadGetId(), osPriorityNormal);
     commOutT.start(commOutFn);
+    commDec.start(commDecFn);
+    //minning.start(mine);
 
     // Set PWM freq
-    //setPWMperiod(0.00001);
-    motorOff();
+    setPWMperiod(PWMPeriod);
+    //motorOff();
 
     //Initialise the serial port
     
     //int8_t intState = 0;
     //int8_t intStateOld = 0;
-    putMessage(1, 1);
+    putMessage(1, 0x999);
     
     //Run the motor synchronisation, should be 1 for motor 13
     //orState = motorHome();
     orState = motorHome();
-    pc.printf("Rotor origin: %x\n\r",orState);
+    //pc.printf("Rotor origin: %x\n\r",orState);
     if(orState !=3 && debugFlag){
         motorOut((-orState+lead+6)%6, 0);
-        wait(1);
         orState = motorHome();
     }
     if(orState !=3 && debugFlag){
         motorOff();
-        pc.printf("Failure to set motor to state 3\n\r");
+        //pc.printf("Failure to set motor to state 3\n\r");
         return 1;
     }
     //orState is subtracted from future rotor state inputs to align rotor and motor states
@@ -141,35 +160,33 @@ int main() {
     t2.start();
     interrupt();
     while (1) {
-        setSpeed();
+        wait_ms(500);
+        
         // pc.printf("tick\n\r");
         if(t1.read() >= 5){
             angVel = largeStep/(6*t1);
-            pc.printf("Speed: %d\n\r", angVel);
+            //pc.printf("Speed: %d\n\r", angVel);
             largeStep = 0;
             t1.reset();
         }
     }
 }
-/*
+
 void setPWMperiod(float period){
-    L1L.period(period);
-    L1H.period(period);
-    L2L.period(period);
-    L2H.period(period);
-    L3L.period(period);
-    L3H.period(period);
-}*/
+    L1L.period_us(period);
+    L2L.period_us(period);
+    L3L.period_us(period);
+}
 
 void interrupt(){
     largeStep++;
-    
+    setSpeed();
 }
 
 void setSpeed(){
     //if(t2.read_ms() >= targetSpeed){
         int8_t intState = readRotorState();
-        motorOut((intState-orState+lead+6)%6, duty); //+6 to make sure the remainder is positive
+        motorOut((intState-orState+lead+6)%6, PWMPeriod*duty); //+6 to make sure the remainder is positive
         // t2.reset();
     //}
 }
@@ -180,7 +197,7 @@ inline int8_t readRotorState(){
 //Basic synchronisation routine    
 int8_t motorHome() {
     //Put the motor in drive state 0 and wait for it to stabilise
-    motorOut(0, 0);
+    motorOut(0, PWMPeriod);
     wait(1.0);
     
     //Get the rotor state
@@ -188,25 +205,25 @@ int8_t motorHome() {
 }
 
 //Set a given drive state
-void motorOut(int8_t driveState, float duty){
+void motorOut(int8_t driveState, uint32_t torque){
     
     //Lookup the output byte from the drive state.
     int8_t driveOut = driveTable[driveState & 0x07];
       
     //Turn off first
-    if (~driveOut & 0x01) L1L = 0;
+    if (~driveOut & 0x01) L1L.pulsewidth_us(0);
     if (~driveOut & 0x02) L1H = 1;
-    if (~driveOut & 0x04) L2L = 0;
+    if (~driveOut & 0x04) L2L.pulsewidth_us(0);
     if (~driveOut & 0x08) L2H = 1;
-    if (~driveOut & 0x10) L3L = 0;
+    if (~driveOut & 0x10) L3L.pulsewidth_us(0);
     if (~driveOut & 0x20) L3H = 1;
     
     //Then turn on
-    if (driveOut & 0x01) L1L = 1;
+    if (driveOut & 0x01) L1L.pulsewidth_us(torque);
     if (driveOut & 0x02) L1H = 0;
-    if (driveOut & 0x04) L2L = 1;
+    if (driveOut & 0x04) L2L.pulsewidth_us(torque);
     if (driveOut & 0x08) L2H = 0;
-    if (driveOut & 0x10) L3L = 1;
+    if (driveOut & 0x10) L3L.pulsewidth_us(torque);
     if (driveOut & 0x20) L3H = 0;
 }
 
@@ -224,7 +241,7 @@ void motorOff(){
 void mine(){
     //Crypto
     SHA256 crypt;
-    Serial pc2(SERIAL_TX, SERIAL_RX);
+    //rial pc2(SERIAL_TX, SERIAL_RX);
     uint8_t sequence[] = {0x45,0x6D,0x62,0x65,0x64,0x64,0x65,0x64,
     0x20,0x53,0x79,0x73,0x74,0x65,0x6D,0x73,
     0x20,0x61,0x72,0x65,0x20,0x66,0x75,0x6E,
@@ -239,23 +256,29 @@ void mine(){
     
     uint8_t hashCount = 0;
     Timer t;
+    
 
     while (1) {
         t.start();
-        *key = 0;
+        //putMessage(90, 1);
+        newKey_mutex.lock();
+        *key = newKey;
+        newKey_mutex.unlock();
         crypt.computeHash(hash, sequence, 64);
+
         *nonce = *nonce + 1;
         //pc.printf("%d\n\r", nonce);
         if(hash[0] == 0 && hash[1] == 0){
-            pc2.printf("Found\n\r");
+            putMessage(90, *key);
+            putMessage(91, *nonce);
             hashCount++;
         }
         //t.stop();
-        if(t.read() > 1){
-            t.reset();
-            pc2.printf("%d\n\r", hashCount);
-            hashCount = 0;
-        }
+        // if(t.read() > 1){
+        //     t.reset();
+        //     pc2.printf("%d\n\r", hashCount);
+        //     hashCount = 0;
+        // }
         //t.start()
     }
 }
@@ -264,7 +287,7 @@ void commOutFn(){
     while(1) {
 osEvent newEvent = outMessages.get();
 message_t *pMessage = (message_t*)newEvent.value.p;
-pc.printf("Message %d with data 0x%016x\n",
+pc.printf("Message %d with data 0x%016x\r\n",
 pMessage->code,pMessage->data);
 outMessages.free(pMessage);
  }
@@ -276,3 +299,58 @@ void putMessage(uint8_t code, uint32_t data){
     pMessage->data = data;
     outMessages.put(pMessage);
  }
+
+ void serialISR(){
+     uint8_t newChar = pc.getc();
+     inCharQ.put((void*)newChar);
+ }
+
+ void commDecFn(){
+     pc.attach(&serialISR);
+     inCommPtr = 0;
+     while(1){
+         osEvent newEvent = inCharQ.get();
+         uint8_t newChar = (uint8_t) newEvent.value.p;
+        if(newChar != (char)'\r'){
+            inComm[inCommPtr++] = newChar;
+        }else{
+            inComm[inCommPtr++] = (char)'\0';
+            inCommPtr = 0;
+            // Decode command
+            if(inComm[0] == (char)'R') decodeR();
+            if(inComm[0] == (char)'V') decodeV();
+            if(inComm[0] == (char)'K') decodeK();
+            if(inComm[0] == (char)'T') decodeT();
+        }
+        if(inCommPtr == 30){
+            inCommPtr = 0;
+        }
+        
+     }
+
+     
+ }
+
+ void decodeK(){
+     newKey_mutex.lock();
+     //sscanf(inComm, "K%llx", &newKey);
+     uint8_t* tempPtr = (uint8_t*) &newKey;
+     unsigned int tempInt1;
+     unsigned int  tempInt2;
+     for(int i = 0; i < 16; i = i + 2){
+         
+         sscanf(&inComm[16-i], "%1x", &tempInt1);
+         sscanf(&inComm[15-i], "%1x", &tempInt2);
+         *tempPtr = (uint8_t)(tempInt2 << 4 | tempInt1);
+         tempPtr++;
+     }
+     newKey_mutex.unlock();
+ }
+ 
+void decodeR(){};
+void decodeV(){};
+void decodeT(){
+    unsigned int tempInt1;
+    sscanf(&inComm[3], "%2u", &tempInt1);
+    duty = ((float) tempInt1)/100;
+}
