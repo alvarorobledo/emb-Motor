@@ -1,6 +1,5 @@
 #include "SHA2_32.h"
-#include <string.h>
-
+#include "string.h"
 
 
 static const uint8_t MASK = 0x0F;
@@ -35,7 +34,7 @@ static const uint32_t H[] =
     0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
 };
 
-static uint32_t revWord(const uint32_t w)
+inline static uint32_t revWord(const uint32_t w)
 {
 #ifdef __CC_ARM
     return __rev(w);
@@ -47,7 +46,7 @@ static uint32_t revWord(const uint32_t w)
 #endif
 } 
 
-static uint32_t rotRWord(const uint32_t w, const uint32_t n)
+inline static uint32_t rotRWord(const uint32_t w, const uint32_t n)
 {
 #ifdef __CC_ARM
     return __ror(w, n);
@@ -245,7 +244,7 @@ void SHA2_32::computeHash(SHA_32_TYPE type, uint8_t *hash, uint8_t *data, uint32
 
 
 #ifdef __CC_ARM
-__forceinline 
+//__forceinline 
 #endif 
 void SHA2_32::computeBlock(uint32_t *h02, 
                         uint32_t *h12, 

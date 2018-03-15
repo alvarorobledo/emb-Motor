@@ -41,7 +41,7 @@ const int8_t stateMap[] = {0x07,0x05,0x03,0x04,0x01,0x00,0x02,0x07};
 //const int8_t stateMap[] = {0x07,0x01,0x03,0x02,0x05,0x00,0x04,0x07}; //Alternative if phase order of input or drive is reversed
 
 //Phase lead to make motor spin
-const int8_t lead = 2;  //2 for forwards, -2 for backwards
+int8_t lead = 2;  //2 for forwards, -2 for backwards
 
 //Status LED
 DigitalOut led1(LED1);
@@ -75,28 +75,43 @@ void commDecFn();
 void decodeR();
 void decodeV();
 void decodeK();
-void decodeT();
+void decodeD();
+void motorCtrlFn();
+void motorCtrlTick();
+float fabs(float a);
 // Define Threads
 
 // Declare global variables
 int8_t orState = 0;    //Rotot offset at motor state 0
 int32_t largeStep = 0;   
 int32_t angVel = 0;
-int32_t setVel = 10;
+volatile int32_t setVel = 50*6;
+float motorPower = 0;
 Timer t2;
-int32_t targetSpeed = 0;
-float duty = 1;
+float duty = 0.5;
 bool debugFlag = true;
 char inComm[30]; // Input command
 int inCommPtr = 0; // Pointer to the first empty position of the buff array
 //volatile uint64_t newKey = 0;
 volatile uint64_t newKey = 0;
-float PWMPeriod = 128;
+float PWMPeriod = 2000;
 Mutex newKey_mutex;
+Mutex motorPosition_mutex;
+Mutex currentVel_mutex;
+Mutex motorPower_mutex;
+Mutex setVel_mutex;
+int32_t motorPosition;
+int32_t oldMotorPosition;
+int32_t currentVelocity = 0;
+int32_t velOutputCount = 0;
+int8_t kp = 25;
+float currentVel = 0;
+
 // Threads
-Thread commOutT = Thread(osPriorityNormal);
-Thread commDec = Thread(osPriorityNormal);// Command decode thread
-Thread minning = Thread(osPriorityNormal, 1024);
+Thread commOutT = Thread(osPriorityNormal, 1024);
+Thread commDec = Thread(osPriorityRealtime, 512);// Command decode thread
+//Thread minning = Thread(osPriorityNormal, 1024);
+Thread motorCtrlT (osPriorityNormal, 1024);
 
 typedef struct{
     uint8_t code;
@@ -107,6 +122,7 @@ Queue<void, 8> inCharQ;
 
 RawSerial pc(SERIAL_TX, SERIAL_RX);
   
+  
 //Main
 int main() {
     
@@ -114,8 +130,9 @@ int main() {
     osThreadSetPriority(osThreadGetId(), osPriorityNormal);
     commOutT.start(commOutFn);
     commDec.start(commDecFn);
+    motorCtrlT.start(motorCtrlFn);
     //minning.start(mine);
-
+    //putMessage(0, osThreadGetId())
     // Set PWM freq
     setPWMperiod(PWMPeriod);
     //motorOff();
@@ -155,12 +172,17 @@ int main() {
     //miningThr.start(mine)
     // osThreadCreate(osThread(mine), NULL);
     Timer t1;
-    targetSpeed = 1000/(6*setVel);
-    t1.start();
-    t2.start();
+    //t1.start();
+    //t2.start();
     interrupt();
     while (1) {
-        wait_ms(500);
+        wait(2);
+        putMessage(5, currentVel/6);
+        //currentVel_mutex.lock();
+        //putMessage(4, motorPosition);
+        //putMessage(5, currentVel*-1);
+        //currentVel_mutex.unlock();
+        /*wait_ms(500);
         
         // pc.printf("tick\n\r");
         if(t1.read() >= 5){
@@ -168,7 +190,7 @@ int main() {
             //pc.printf("Speed: %d\n\r", angVel);
             largeStep = 0;
             t1.reset();
-        }
+        }*/
     }
 }
 
@@ -179,8 +201,18 @@ void setPWMperiod(float period){
 }
 
 void interrupt(){
-    largeStep++;
-    setSpeed();
+    static int8_t oldRotorState;
+    int8_t rotorState = readRotorState();
+    
+    motorPower_mutex.lock();
+    motorOut((rotorState-orState+lead+6)%6, fabs(motorPower));
+    motorPower_mutex.unlock();
+    motorPosition_mutex.lock();
+    if(rotorState - oldRotorState == 5) motorPosition--;
+    else if(rotorState - oldRotorState == -5) motorPosition++;
+    else motorPosition += (rotorState - oldRotorState);
+    motorPosition_mutex.unlock();
+    oldRotorState = rotorState;
 }
 
 void setSpeed(){
@@ -287,7 +319,7 @@ void commOutFn(){
     while(1) {
 osEvent newEvent = outMessages.get();
 message_t *pMessage = (message_t*)newEvent.value.p;
-pc.printf("Message %d with data 0x%016x\r\n",
+pc.printf("Message %d with data 0x%016d\r\n",
 pMessage->code,pMessage->data);
 outMessages.free(pMessage);
  }
@@ -320,7 +352,7 @@ void putMessage(uint8_t code, uint32_t data){
             if(inComm[0] == (char)'R') decodeR();
             if(inComm[0] == (char)'V') decodeV();
             if(inComm[0] == (char)'K') decodeK();
-            if(inComm[0] == (char)'T') decodeT();
+            if(inComm[0] == (char)'D') decodeD();
         }
         if(inCommPtr == 30){
             inCommPtr = 0;
@@ -348,9 +380,75 @@ void putMessage(uint8_t code, uint32_t data){
  }
  
 void decodeR(){};
-void decodeV(){};
-void decodeT(){
-    unsigned int tempInt1;
-    sscanf(&inComm[3], "%2u", &tempInt1);
-    duty = ((float) tempInt1)/100;
+void decodeV(){
+    int Vel;
+    sscanf(inComm, "V%u", &Vel);
+    Vel = Vel*6;
+    if(Vel == 0){
+        Vel = 2000;
+    }
+    setVel = Vel;
+}
+void decodeD(){
+    sscanf(inComm, "D0.2%u", &duty);
+}
+
+void motorCtrlFn(){
+    Ticker motorCtrlTicker;
+    //motorCtrlTicker.attach_us(&motorCtrlTick, 100000);
+    int32_t motorPositionDif = 0;
+    Timer mt;
+    mt.start();
+    float pastVel1 = 0;
+    float pastVel2 = 0;
+    while(1){
+       // motorCtrlT.signal_wait(0x1);
+        //motorPosition_mutex.lock();
+        wait_us(50000);
+        //motorPosition_mutex.unlock();
+        //currentVelocity = motorPositionDif*10;
+        
+        //putMessage(5, motorPositionDif);
+        //currentVel_mutex.lock();
+        
+
+        currentVel = (motorPosition/mt.read()+pastVel1+pastVel2)/3;
+        pastVel2=pastVel1;
+        pastVel1 = currentVel;
+        mt.reset();
+        
+        //motorPower_mutex.lock();
+        motorPower = kp*(setVel - fabs(currentVel));
+        //motorPower = 50;
+        if(motorPower < 0){
+            lead = -2;
+        } else {
+            lead = 2;
+        }
+        if(fabs(motorPower)>1000){
+            motorPower =1000;
+        }
+        //motorPower_mutex.unlock();
+
+        //currentVel_mutex.unlock();
+        
+        motorPosition_mutex.lock();
+        motorPosition = 0;
+        motorPosition_mutex.unlock();
+        velOutputCount = 0;
+        
+        
+    }
+
+}
+
+void motorCtrlTick(){
+    //motorCtrlT.signal_set(0x1);
+}
+
+float fabs(float a){
+    if(a < 0){
+        return a*-1;
+    }
+    return a;
 }
