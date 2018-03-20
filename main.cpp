@@ -60,32 +60,37 @@ PwmOut L3L(L3Lpin);
 DigitalOut L3H(L3Hpin);
 
 // Function prototypes
-void mine();
-void interrupt();
+
 inline int8_t readRotorState();
 int8_t motorHome();
 void motorOut(int8_t driveState, uint32_t torque);
-void setSpeed();
-void setPWMperiod(float period);
-void motorOff();
+void interrupt();
 void commOutFn();
 void putMessage(uint8_t code, uint32_t data);
 void serialISR();
 void commDecFn();
+void motorCtrlFn();
+void motorCtrlTick();
+
+// Our defined functions
+void mine();
+void setSpeed();
+void setPWMperiod(float period);
+void motorOff();
 void decodeR();
 void decodeV();
 void decodeK();
 void decodeD();
-void motorCtrlFn();
-void motorCtrlTick();
 float fabs(float a);
+void updateSetVel(int32_t vel);
+
 // Define Threads
 
 // Declare global variables
 int8_t orState = 0;    //Rotot offset at motor state 0
 int32_t largeStep = 0;   
 int32_t angVel = 0;
-volatile int32_t setVel = 50*6;
+volatile int32_t setVel = 40*6;
 float motorPower = 0;
 Timer t2;
 float duty = 0.5;
@@ -109,7 +114,7 @@ float currentVel = 0;
 
 // Threads
 Thread commOutT = Thread(osPriorityNormal, 1024);
-Thread commDec = Thread(osPriorityRealtime, 512);// Command decode thread
+Thread commDec = Thread(osPriorityNormal, 1024);// Command decode thread
 //Thread minning = Thread(osPriorityNormal, 1024);
 Thread motorCtrlT (osPriorityNormal, 1024);
 
@@ -118,6 +123,8 @@ typedef struct{
     uint32_t data;
  } message_t ;
 Mail<message_t,16> outMessages;
+//Mail<int32_t, 2> setVel_mail;
+
 Queue<void, 8> inCharQ;
 
 RawSerial pc(SERIAL_TX, SERIAL_RX);
@@ -147,15 +154,19 @@ int main() {
     //orState = motorHome();
     orState = motorHome();
     //pc.printf("Rotor origin: %x\n\r",orState);
-    if(orState !=3 && debugFlag){
-        motorOut((-orState+lead+6)%6, 0);
-        orState = motorHome();
-    }
-    if(orState !=3 && debugFlag){
-        motorOff();
-        //pc.printf("Failure to set motor to state 3\n\r");
-        return 1;
-    }
+
+
+    // if(orState !=3 && debugFlag){
+    //     motorOut((-orState+lead+6)%6, 0);
+    //     orState = motorHome();
+    // }
+    // if(orState !=3 && debugFlag){
+    //     motorOff();
+    //     //pc.printf("Failure to set motor to state 3\n\r");
+    //     return 1;
+    // }
+
+
     //orState is subtracted from future rotor state inputs to align rotor and motor states
     
     
@@ -205,23 +216,22 @@ void interrupt(){
     int8_t rotorState = readRotorState();
     
     motorPower_mutex.lock();
-    motorOut((rotorState-orState+lead+6)%6, fabs(motorPower));
+    //motorOut((rotorState-orState+lead+6)%6, fabs(motorPower));
     motorPower_mutex.unlock();
-    motorPosition_mutex.lock();
+
     if(rotorState - oldRotorState == 5) motorPosition--;
     else if(rotorState - oldRotorState == -5) motorPosition++;
     else motorPosition += (rotorState - oldRotorState);
-    motorPosition_mutex.unlock();
-    oldRotorState = rotorState;
 }
-
+/*
 void setSpeed(){
     //if(t2.read_ms() >= targetSpeed){
         int8_t intState = readRotorState();
         motorOut((intState-orState+lead+6)%6, PWMPeriod*duty); //+6 to make sure the remainder is positive
         // t2.reset();
     //}
-}
+}*/
+
 inline int8_t readRotorState(){
     return stateMap[I1 + 2*I2 + 4*I3];
 }
@@ -317,12 +327,12 @@ void mine(){
 
 void commOutFn(){
     while(1) {
-osEvent newEvent = outMessages.get();
-message_t *pMessage = (message_t*)newEvent.value.p;
-pc.printf("Message %d with data 0x%016d\r\n",
-pMessage->code,pMessage->data);
-outMessages.free(pMessage);
- }
+        osEvent newEvent = outMessages.get();
+        message_t *pMessage = (message_t*)newEvent.value.p;
+        pc.printf("Message %d with data 0x%016d\r\n",
+        pMessage->code,pMessage->data);
+        outMessages.free(pMessage);
+    }
 }
 
 void putMessage(uint8_t code, uint32_t data){
@@ -332,17 +342,18 @@ void putMessage(uint8_t code, uint32_t data){
     outMessages.put(pMessage);
  }
 
- void serialISR(){
+void serialISR(){
      uint8_t newChar = pc.getc();
      inCharQ.put((void*)newChar);
  }
 
  void commDecFn(){
      pc.attach(&serialISR);
+     // inCommPtr stores the next empty index in inComm array (stores incomming message from serial)
      inCommPtr = 0;
      while(1){
-         osEvent newEvent = inCharQ.get();
-         uint8_t newChar = (uint8_t) newEvent.value.p;
+            osEvent newEvent = inCharQ.get();
+            uint8_t newChar = (uint8_t) newEvent.value.p;
         if(newChar != (char)'\r'){
             inComm[inCommPtr++] = newChar;
         }else{
@@ -356,14 +367,12 @@ void putMessage(uint8_t code, uint32_t data){
         }
         if(inCommPtr == 30){
             inCommPtr = 0;
-        }
-        
+        }   
      }
+}
 
-     
- }
-
- void decodeK(){
+// Set key for bitcoin minning
+void decodeK(){
      newKey_mutex.lock();
      //sscanf(inComm, "K%llx", &newKey);
      uint8_t* tempPtr = (uint8_t*) &newKey;
@@ -383,24 +392,34 @@ void decodeR(){};
 void decodeV(){
     int Vel;
     sscanf(inComm, "V%u", &Vel);
+    // Multiply income velocity times 6, as a rotation is 6 interrupts
     Vel = Vel*6;
     if(Vel == 0){
         Vel = 2000;
     }
-    setVel = Vel;
+    // setVel is a global variable which stores the desired max. speed
+
+    //updateSetVel(Vel);
+    // setVel_mutex.lock();
+    // setVel = 20*6;
+    
+    // setVel_mutex.unlock();
+    // putMessage(58, setVel);
 }
 void decodeD(){
     sscanf(inComm, "D0.2%u", &duty);
 }
 
 void motorCtrlFn(){
-    Ticker motorCtrlTicker;
+    //Ticker motorCtrlTicker;
     //motorCtrlTicker.attach_us(&motorCtrlTick, 100000);
-    int32_t motorPositionDif = 0;
+    //int32_t motorPositionDif = 0;
     Timer mt;
     mt.start();
     float pastVel1 = 0;
     float pastVel2 = 0;
+    float pastVel3 = 0;
+    float pastVel4 = 0;
     while(1){
        // motorCtrlT.signal_wait(0x1);
         //motorPosition_mutex.lock();
@@ -411,12 +430,19 @@ void motorCtrlFn(){
         //putMessage(5, motorPositionDif);
         //currentVel_mutex.lock();
         
-
-        currentVel = (motorPosition/mt.read()+pastVel1+pastVel2)/3;
-        pastVel2=pastVel1;
+        currentVel = (motorPosition/mt.read()+pastVel1+pastVel2+pastVel3+pastVel4)/5;
+        pastVel4 = pastVel3;
+        pastVel3 = pastVel2;
+        pastVel2 = pastVel1;
         pastVel1 = currentVel;
         mt.reset();
         
+        // Check if there is an update to the vel
+        // osEvent newEvent = setVel_mail.get();
+        // int32_t *uSetVel = (int32_t*)newEvent.value.p;
+        // setVel = uSetVel;
+        // setVel_mail.free(uSetVel);
+
         //motorPower_mutex.lock();
         motorPower = kp*(setVel - fabs(currentVel));
         //motorPower = 50;
@@ -431,11 +457,9 @@ void motorCtrlFn(){
         //motorPower_mutex.unlock();
 
         //currentVel_mutex.unlock();
-        
-        motorPosition_mutex.lock();
+
         motorPosition = 0;
-        motorPosition_mutex.unlock();
-        velOutputCount = 0;
+        //velOutputCount = 0;
         
         
     }
@@ -452,3 +476,9 @@ float fabs(float a){
     }
     return a;
 }
+/*
+void updateSetVel(int32_t vel){
+    int32_t *uSetVel = setVel_mail.alloc();
+    *uSetVel = vel;
+    setVel_mail.put(uSetVel);
+}*/
