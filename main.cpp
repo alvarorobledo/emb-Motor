@@ -40,9 +40,6 @@ const int8_t driveTable[] = {0x12,0x18,0x09,0x21,0x24,0x06,0x00,0x00};
 const int8_t stateMap[] = {0x07,0x05,0x03,0x04,0x01,0x00,0x02,0x07};  
 //const int8_t stateMap[] = {0x07,0x01,0x03,0x02,0x05,0x00,0x04,0x07}; //Alternative if phase order of input or drive is reversed
 
-//Phase lead to make motor spin
-int8_t lead = 2;  //2 for forwards, -2 for backwards
-
 //Status LED
 DigitalOut led1(LED1);
 
@@ -59,184 +56,205 @@ DigitalOut L2H(L2Hpin);
 PwmOut L3L(L3Lpin);
 DigitalOut L3H(L3Hpin);
 
-// Function prototypes
+//Threads
+Thread commOutT(osPriorityNormal, 1024);
+Thread commDec(osPriorityNormal, 2048);
+Thread motorCtrlT(osPriorityNormal, 1024);
+//Thread minning = Thread(osPriorityNormal, 1024);
 
-inline int8_t readRotorState();
+int sgn(int val);
+float max(float a, float b);
+float min(float a, float b);
+
+//Function prototypes and global variables
+void photoInterrupt();                          // Function which handles the photo interrupts
 int8_t motorHome();
+int8_t orState = 0;
 void motorOut(int8_t driveState, uint32_t torque);
-void interrupt();
-void commOutFn();
-void putMessage(uint8_t code, uint32_t data);
-void serialISR();
-void commDecFn();
-void motorCtrlFn();
+void setPWMperiod(float period);
+
+//Phase lead to make motor spin
+int8_t lead = 2;  //2 for forwards, -2 for backwards
+float PWMPeriod = 2000;
+float motorPower = 0;
+int kp = 35;
+int kd = 20;
+
+void motorCtrlFn();                             // Main function in motor control thread
+inline int8_t readRotorState();
+
+int32_t motorPosition = 0;
+int32_t distanceToTarget = 0;
+Mutex distanceToTarget_mutex;
+int32_t setVel = 6*50;
+Mutex setVel_mutex;
 void motorCtrlTick();
 
-// Our defined functions
+
+void commOutFn();                               // main function in serial communication thread
+void putMessage(uint8_t code, uint32_t data);   // output message to serial comm
+
+void commDecFn();                               // main function in commands decoding thread
+void decodeV(char data[], int size);            // decode velocity messages
+void decodeR(char data[], int size);
+void decodeK(char data[], int size);
 void mine();
-void setSpeed();
-void setPWMperiod(float period);
-void motorOff();
-void decodeR();
-void decodeV();
-void decodeK();
-void decodeD();
-float fabs(float a);
-void updateSetVel(int32_t vel);
 
-// Define Threads
-
-// Declare global variables
-int8_t orState = 0;    //Rotot offset at motor state 0
-int32_t largeStep = 0;   
-int32_t angVel = 0;
-volatile int32_t setVel = 40*6;
-float motorPower = 0;
-Timer t2;
-float duty = 0.5;
-bool debugFlag = true;
-char inComm[30]; // Input command
-int inCommPtr = 0; // Pointer to the first empty position of the buff array
-//volatile uint64_t newKey = 0;
+//
 volatile uint64_t newKey = 0;
-float PWMPeriod = 2000;
 Mutex newKey_mutex;
-Mutex motorPosition_mutex;
-Mutex currentVel_mutex;
-Mutex motorPower_mutex;
-Mutex setVel_mutex;
-int32_t motorPosition;
-int32_t oldMotorPosition;
-int32_t currentVelocity = 0;
-int32_t velOutputCount = 0;
-int8_t kp = 25;
-float currentVel = 0;
 
-// Threads
-Thread commOutT = Thread(osPriorityNormal, 1024);
-Thread commDec = Thread(osPriorityNormal, 1024);// Command decode thread
-//Thread minning = Thread(osPriorityNormal, 1024);
-Thread motorCtrlT (osPriorityNormal, 1024);
-
-typedef struct{
+typedef struct{                     // Struct used to send data to serial
     uint8_t code;
     uint32_t data;
- } message_t ;
-Mail<message_t,16> outMessages;
-//Mail<int32_t, 2> setVel_mail;
+} message_t ;
+Mail<message_t,16> outMessages;     // Mail to send data to serial from any thread
 
-Queue<void, 8> inCharQ;
+Queue<void, 8> inCharQ;             // Queue for incomming characters
 
+// Serial instantiation
 RawSerial pc(SERIAL_TX, SERIAL_RX);
-  
-  
+
 //Main
 int main() {
-    
-    //Thread 
-    osThreadSetPriority(osThreadGetId(), osPriorityNormal);
+
+    // Start threads ****************************************************************************************
+    // Start communication with the terminal thread
     commOutT.start(commOutFn);
+    // Start commands decoding thread
     commDec.start(commDecFn);
-    motorCtrlT.start(motorCtrlFn);
-    //minning.start(mine);
-    //putMessage(0, osThreadGetId())
-    // Set PWM freq
+    
     setPWMperiod(PWMPeriod);
-    //motorOff();
-
-    //Initialise the serial port
-    
-    //int8_t intState = 0;
-    //int8_t intStateOld = 0;
-    putMessage(1, 0x999);
-    
-    //Run the motor synchronisation, should be 1 for motor 13
-    //orState = motorHome();
     orState = motorHome();
-    //pc.printf("Rotor origin: %x\n\r",orState);
 
+    // Set the interrupts to the corresponding pins
+    I1.rise(&photoInterrupt);
+    I1.fall(&photoInterrupt);
+    I2.rise(&photoInterrupt);
+    I2.fall(&photoInterrupt);
+    I3.rise(&photoInterrupt);
+    I3.fall(&photoInterrupt);
 
-    // if(orState !=3 && debugFlag){
-    //     motorOut((-orState+lead+6)%6, 0);
-    //     orState = motorHome();
-    // }
-    // if(orState !=3 && debugFlag){
-    //     motorOff();
-    //     //pc.printf("Failure to set motor to state 3\n\r");
-    //     return 1;
-    // }
+    // Start motor control thread;
+    motorCtrlT.start(motorCtrlFn);
 
+    // Modify main thread priority to low
+    //osThreadSetPriority(osThreadGetId(), osPriorityLow);
 
-    //orState is subtracted from future rotor state inputs to align rotor and motor states
-    
-    
-    I1.rise(&interrupt);
-    I1.fall(&interrupt);
-    I2.rise(&interrupt);
-    I2.fall(&interrupt);
-    I3.rise(&interrupt);
-    I3.fall(&interrupt);
-    
-    //Poll the rotor state and set the motor outputs accordingly to spin the motor
-    interrupt();
-    
-    //miningThr.start(mine)
-    // osThreadCreate(osThread(mine), NULL);
-    Timer t1;
-    //t1.start();
-    //t2.start();
-    interrupt();
-    while (1) {
-        wait(2);
-        putMessage(5, currentVel/6);
-        //currentVel_mutex.lock();
-        //putMessage(4, motorPosition);
-        //putMessage(5, currentVel*-1);
-        //currentVel_mutex.unlock();
-        /*wait_ms(500);
-        
-        // pc.printf("tick\n\r");
-        if(t1.read() >= 5){
-            angVel = largeStep/(6*t1);
-            //pc.printf("Speed: %d\n\r", angVel);
-            largeStep = 0;
-            t1.reset();
-        }*/
-    }
+    // Send ready code
+    putMessage(99, 1);
+    //photoInterrupt();
+
+    mine();
+
 }
 
-void setPWMperiod(float period){
-    L1L.period_us(period);
-    L2L.period_us(period);
-    L3L.period_us(period);
-}
-
-void interrupt(){
+void photoInterrupt(){
     static int8_t oldRotorState;
     int8_t rotorState = readRotorState();
     
-    motorPower_mutex.lock();
-    //motorOut((rotorState-orState+lead+6)%6, fabs(motorPower));
-    motorPower_mutex.unlock();
 
+    motorOut((rotorState-orState+lead+6)%6, motorPower);
     if(rotorState - oldRotorState == 5) motorPosition--;
     else if(rotorState - oldRotorState == -5) motorPosition++;
     else motorPosition += (rotorState - oldRotorState);
-}
-/*
-void setSpeed(){
-    //if(t2.read_ms() >= targetSpeed){
-        int8_t intState = readRotorState();
-        motorOut((intState-orState+lead+6)%6, PWMPeriod*duty); //+6 to make sure the remainder is positive
-        // t2.reset();
-    //}
-}*/
-
-inline int8_t readRotorState(){
-    return stateMap[I1 + 2*I2 + 4*I3];
+    oldRotorState = rotorState;
 }
 
-//Basic synchronisation routine    
+// Motor control functions ************************************************
+void motorCtrlFn(){
+    volatile int32_t desiredVel = 0;
+    float measuredVel = 0;
+    float nextMotorPower;
+    float nextMotorPowerS = 0;
+    float nextMotorPowerR = 0;
+    Ticker motorCtrlTicker; 
+    motorCtrlTicker.attach_us(&motorCtrlTick,100000);
+    Timer motorTimer;
+    motorTimer.start();
+    Timer motorTimer2;
+    motorTimer2.start();
+    int8_t timeReportCounter = 0;
+    float pastVel1 = 0;
+    float pastVel2 = 0;
+    int oldDistanceToTarget = distanceToTarget;
+    int32_t motorPositionTemp;
+    int nearPos = 0;
+    while(1){
+
+        // Check speed update message
+        setVel_mutex.lock();
+        desiredVel = setVel;
+        setVel_mutex.unlock();
+
+        //wait_us(50000);
+        motorCtrlT.signal_wait(0x1);
+        motorPositionTemp = motorPosition;
+        measuredVel = motorPositionTemp/motorTimer.read();
+        motorTimer.reset();
+        //pastVel2 = pastVel1;
+        //pastVel1 = measuredVel;
+
+        if(measuredVel == 0 && abs(distanceToTarget)>0){
+            photoInterrupt();
+            nearPos = 0;
+        }
+
+        // Update error
+        distanceToTarget -= motorPositionTemp;
+        //putMessage(4, distanceToTarget);
+        //putMessage(5, distanceToTarget);
+
+        nextMotorPowerS = kp*(desiredVel - fabs(measuredVel))*sgn(distanceToTarget);
+        nextMotorPowerR = kp*distanceToTarget+kd*(distanceToTarget-oldDistanceToTarget)/motorTimer2.read();
+        motorTimer2.reset();
+        oldDistanceToTarget = distanceToTarget;
+
+        if(distanceToTarget<0){
+            nextMotorPower = max(nextMotorPowerR, nextMotorPowerS);
+        } else {
+            nextMotorPower = min(nextMotorPowerR, nextMotorPowerS);
+        }
+
+        if(fabs(distanceToTarget) < 6){
+            nextMotorPower = 0;
+            if(nearPos != 1){
+                putMessage(50, abs(distanceToTarget));
+                nearPos = 1;
+            }
+            distanceToTarget = 0;
+            
+        }
+
+
+        if(nextMotorPower < 0){
+            lead = -2;
+            nextMotorPower = fabs(nextMotorPower);
+        } else {
+            lead = 2;
+        }
+        if(fabs(nextMotorPower)>1000){
+            nextMotorPower=1000;
+        }
+        motorPower = nextMotorPower;
+        
+        motorPosition = 0;
+        
+        if(timeReportCounter++ == 19){
+            if(measuredVel != 0 ){
+                putMessage(10, measuredVel/6);
+            }
+            
+            //putMessage(10, distanceToTarget);
+            timeReportCounter = 0;
+        }
+        
+        //
+
+    }
+}
+
+//Basic synchronisation routine
 int8_t motorHome() {
     //Put the motor in drive state 0 and wait for it to stabilise
     motorOut(0, PWMPeriod);
@@ -269,15 +287,157 @@ void motorOut(int8_t driveState, uint32_t torque){
     if (driveOut & 0x20) L3H = 0;
 }
 
-void motorOff(){
+void setPWMperiod(float period){
+    L1L.period_us(period);
+    L2L.period_us(period);
+    L3L.period_us(period);
+}
+
+void motorCtrlTick(){motorCtrlT.signal_set(0x1);}
+
+inline int8_t readRotorState(){
+    return stateMap[I1 + 2*I2 + 4*I3];
+}
+
+void commOutFn(){
+    while(1) {
+        osEvent newEvent = outMessages.get();
+        message_t *pMessage = (message_t*)newEvent.value.p;
+        pc.printf("Message %d with data 0x%016x\r\n",
+        pMessage->code,pMessage->data);
+        outMessages.free(pMessage);
+    }
+}
+
+void putMessage(uint8_t code, uint32_t data){
+    message_t *pMessage = outMessages.alloc();
+    pMessage->code = code;
+    pMessage->data = data;
+    outMessages.put(pMessage);
+ }
+
+void serialISR(){
+    uint8_t newChar = pc.getc();
+    inCharQ.put((void*)newChar);
+}
+
+// Serial commands decoding functions******************************************
+void commDecFn(){
+    pc.attach(&serialISR);
+
+    // inCommPtr stores the next empty index in inComm array (stores incomming message from serial)
+    int inCommPtr = 0;
+    const int textBufferSize = 30;
+    char inComm[textBufferSize];
+
+    while(1){
+            osEvent newEvent = inCharQ.get();
+            uint8_t newChar = (uint8_t) newEvent.value.p;
+        if(newChar != (char)'\r'){
+            inComm[inCommPtr++] = newChar;
+        }else{
+            inComm[inCommPtr++] = (char)'\0';
+            inCommPtr = 0;
+            // Decode command
+            if(inComm[0] == (char)'R') decodeR(inComm, textBufferSize);
+            if(inComm[0] == (char)'V') decodeV(inComm, textBufferSize);
+            if(inComm[0] == (char)'K') decodeK(inComm, textBufferSize);//decodeK();
+        }
+        if(inCommPtr == 30){
+            inCommPtr = 0;
+        }   
+    }
+}
+
+void decodeV(char data[], int size){
+    //Decode velocity
+    int32_t newVel;
+    sscanf(data, "V%u", &newVel);
+    newVel = newVel*6;
+    if(newVel == 0){
+        newVel = 2000;
+    }
+    //Send the new velocity to motor control thread
+    setVel_mutex.lock();
+    setVel = newVel;
+    setVel_mutex.unlock();
+    /*int32_t *velMessage = newVel_Mail.alloc();
+    *velMessage = newVel;
+    newVel_Mail.put(velMessage);*/
+}
+
+void decodeR(char data[], int size){
+    //Decode velocity
+    int32_t newTarget;
+    sscanf(data, "R%u", &newTarget);
+    if(newTarget != 0){
+        newTarget = newTarget*6 + orState;
+    } else {
+        newTarget = 2147483647;
+    }
+    
+    putMessage(6, newTarget);
+    distanceToTarget_mutex.lock();
+    distanceToTarget = (int32_t) newTarget;
+    distanceToTarget_mutex.unlock();
+}
+
+void decodeK(char data[], int size){
      
-    //Turn off first
-    L1L = 0;
-    L1H = 1;
-    L2L = 0;
-    L2H = 1;
-    L3L = 0;
-    L3H = 1;
+     uint64_t tempInt1 = 0;
+     uint32_t  tempInt2 = 0;
+     //uint64_t finalKey = 0;
+     //sscanf(inComm, "K%llx", &newKey);
+     /*uint8_t* tempPtr = (uint8_t*) &newKey;
+     
+     for(int i = 0; i < 16; i = i + 2){
+         
+         sscanf(&data[16-i], "%1x", &tempInt1);
+         sscanf(&data[15-i], "%1x", &tempInt2);
+         *tempPtr = (uint8_t)(tempInt2 << 4 | tempInt1);
+         tempPtr++;
+     }*/
+     sscanf(data, "K%8x", &tempInt1);
+     sscanf(data+9, "%8x", &tempInt2);
+     //sscanf(data+36, "%8x", &newKey+32);
+     //pc.printf("%16x", tempInt1);
+     newKey_mutex.lock();
+     newKey = tempInt1 << 32 | tempInt2;
+     newKey_mutex.unlock();
+     //putMessage(76, tempInt1);
+     //putMessage(76, tempInt2);
+    //pc.printf("%16x", finalKey);
+     //newKey_mutex.lock();
+     //newKey = (uint64_t)(tempInt1 << 32 | tempInt2);
+     //newKey_mutex.unlock();
+     //putMessage(76, newKey);
+ }
+
+
+int sgn(int val){
+    if(val>0){
+        return 1;
+    } else if(val<0) {
+        return -1;
+    } else {
+        return 0;
+    }
+}
+
+float max(float a, float b){
+    if(a < b){
+        return b;
+    } else {
+        return a;
+    }
+}
+
+float min(float a, float b){
+    if(a > b){
+        return b;
+    } else {
+        return a;
+    }
 }
 
 void mine(){
@@ -306,6 +466,7 @@ void mine(){
         newKey_mutex.lock();
         *key = newKey;
         newKey_mutex.unlock();
+        //*key = 0;
         crypt.computeHash(hash, sequence, 64);
 
         *nonce = *nonce + 1;
@@ -324,161 +485,3 @@ void mine(){
         //t.start()
     }
 }
-
-void commOutFn(){
-    while(1) {
-        osEvent newEvent = outMessages.get();
-        message_t *pMessage = (message_t*)newEvent.value.p;
-        pc.printf("Message %d with data 0x%016d\r\n",
-        pMessage->code,pMessage->data);
-        outMessages.free(pMessage);
-    }
-}
-
-void putMessage(uint8_t code, uint32_t data){
-    message_t *pMessage = outMessages.alloc();
-    pMessage->code = code;
-    pMessage->data = data;
-    outMessages.put(pMessage);
- }
-
-void serialISR(){
-     uint8_t newChar = pc.getc();
-     inCharQ.put((void*)newChar);
- }
-
- void commDecFn(){
-     pc.attach(&serialISR);
-     // inCommPtr stores the next empty index in inComm array (stores incomming message from serial)
-     inCommPtr = 0;
-     while(1){
-            osEvent newEvent = inCharQ.get();
-            uint8_t newChar = (uint8_t) newEvent.value.p;
-        if(newChar != (char)'\r'){
-            inComm[inCommPtr++] = newChar;
-        }else{
-            inComm[inCommPtr++] = (char)'\0';
-            inCommPtr = 0;
-            // Decode command
-            if(inComm[0] == (char)'R') decodeR();
-            if(inComm[0] == (char)'V') decodeV();
-            if(inComm[0] == (char)'K') decodeK();
-            if(inComm[0] == (char)'D') decodeD();
-        }
-        if(inCommPtr == 30){
-            inCommPtr = 0;
-        }   
-     }
-}
-
-// Set key for bitcoin minning
-void decodeK(){
-     newKey_mutex.lock();
-     //sscanf(inComm, "K%llx", &newKey);
-     uint8_t* tempPtr = (uint8_t*) &newKey;
-     unsigned int tempInt1;
-     unsigned int  tempInt2;
-     for(int i = 0; i < 16; i = i + 2){
-         
-         sscanf(&inComm[16-i], "%1x", &tempInt1);
-         sscanf(&inComm[15-i], "%1x", &tempInt2);
-         *tempPtr = (uint8_t)(tempInt2 << 4 | tempInt1);
-         tempPtr++;
-     }
-     newKey_mutex.unlock();
- }
- 
-void decodeR(){};
-void decodeV(){
-    int Vel;
-    sscanf(inComm, "V%u", &Vel);
-    // Multiply income velocity times 6, as a rotation is 6 interrupts
-    Vel = Vel*6;
-    if(Vel == 0){
-        Vel = 2000;
-    }
-    // setVel is a global variable which stores the desired max. speed
-
-    //updateSetVel(Vel);
-    // setVel_mutex.lock();
-    // setVel = 20*6;
-    
-    // setVel_mutex.unlock();
-    // putMessage(58, setVel);
-}
-void decodeD(){
-    sscanf(inComm, "D0.2%u", &duty);
-}
-
-void motorCtrlFn(){
-    //Ticker motorCtrlTicker;
-    //motorCtrlTicker.attach_us(&motorCtrlTick, 100000);
-    //int32_t motorPositionDif = 0;
-    Timer mt;
-    mt.start();
-    float pastVel1 = 0;
-    float pastVel2 = 0;
-    float pastVel3 = 0;
-    float pastVel4 = 0;
-    while(1){
-       // motorCtrlT.signal_wait(0x1);
-        //motorPosition_mutex.lock();
-        wait_us(50000);
-        //motorPosition_mutex.unlock();
-        //currentVelocity = motorPositionDif*10;
-        
-        //putMessage(5, motorPositionDif);
-        //currentVel_mutex.lock();
-        
-        currentVel = (motorPosition/mt.read()+pastVel1+pastVel2+pastVel3+pastVel4)/5;
-        pastVel4 = pastVel3;
-        pastVel3 = pastVel2;
-        pastVel2 = pastVel1;
-        pastVel1 = currentVel;
-        mt.reset();
-        
-        // Check if there is an update to the vel
-        // osEvent newEvent = setVel_mail.get();
-        // int32_t *uSetVel = (int32_t*)newEvent.value.p;
-        // setVel = uSetVel;
-        // setVel_mail.free(uSetVel);
-
-        //motorPower_mutex.lock();
-        motorPower = kp*(setVel - fabs(currentVel));
-        //motorPower = 50;
-        if(motorPower < 0){
-            lead = -2;
-        } else {
-            lead = 2;
-        }
-        if(fabs(motorPower)>1000){
-            motorPower =1000;
-        }
-        //motorPower_mutex.unlock();
-
-        //currentVel_mutex.unlock();
-
-        motorPosition = 0;
-        //velOutputCount = 0;
-        
-        
-    }
-
-}
-
-void motorCtrlTick(){
-    //motorCtrlT.signal_set(0x1);
-}
-
-float fabs(float a){
-    if(a < 0){
-        return a*-1;
-    }
-    return a;
-}
-/*
-void updateSetVel(int32_t vel){
-    int32_t *uSetVel = setVel_mail.alloc();
-    *uSetVel = vel;
-    setVel_mail.put(uSetVel);
-}*/
