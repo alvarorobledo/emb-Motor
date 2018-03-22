@@ -3,7 +3,6 @@
 #include "Timer.h"
 #include "rtos.h"
 
-
 //Photointerrupter input pins
 #define I1pin D2
 #define I2pin D11
@@ -33,6 +32,7 @@ State   L1  L2  L3
 6       -   -   -
 7       -   -   -
 */
+
 //Drive state to output table
 const int8_t driveTable[] = {0x12,0x18,0x09,0x21,0x24,0x06,0x00,0x00};
 
@@ -48,7 +48,7 @@ InterruptIn I1(I1pin);
 InterruptIn I2(I2pin);
 InterruptIn I3(I3pin);
 
-//Motor Drive outputs
+//Motor Drive outputs, L*L versions defined as PWM
 PwmOut L1L(L1Lpin);
 DigitalOut L1H(L1Hpin);
 PwmOut L2L(L2Lpin);
@@ -56,75 +56,71 @@ DigitalOut L2H(L2Hpin);
 PwmOut L3L(L3Lpin);
 DigitalOut L3H(L3Hpin);
 
-//Threads
-Thread commOutT(osPriorityNormal, 1024);
-Thread commDec(osPriorityNormal, 2048);
-Thread motorCtrlT(osPriorityNormal, 1024);
-//Thread minning = Thread(osPriorityNormal, 1024);
+// Threads
+Thread motorCtrlT(osPriorityNormal, 1024);  // Thread to control the speed and position of the motor
+Thread commOutT(osPriorityNormal, 1024);    // Thread used for outgoing communications to serial
+Thread commDec(osPriorityNormal, 2048);     // Thread to decode incoming regex instructions
 
-int sgn(int val);
-float max(float a, float b);
-float min(float a, float b);
+
+// Function prototypes and global variables
+
 
 //Function prototypes and global variables
-void photoInterrupt();                          // Function which handles the photo interrupts
-int8_t motorHome();
-int8_t orState = 0;
-void motorOut(int8_t driveState, uint32_t torque);
-void setPWMperiod(float period);
+void photoInterrupt();                              // Function which handles the photo interrupts
 
-//Phase lead to make motor spin
-int8_t lead = 2;  //2 for forwards, -2 for backwards
-float PWMPeriod = 2000;
-float motorPower = 0;
-int kp = 35;
-int kd = 20;
+int8_t motorHome();                                 // Function to synchronise the motor's rotor 
+int8_t orState = 0;                                 // Var. to store the rotor pos.  
 
-void motorCtrlFn();                             // Main function in motor control thread
-inline int8_t readRotorState();
+void motorCtrlFn();                                 // Main function in motor control thread
+void setPWMperiod(float period);                    // Function to set the PWM period for all pins
+inline int8_t readRotorState();                     // Function to get the current rotor pos.
+void motorOut(int8_t driveState, uint32_t torque);  // Function to drive the motor
+void motorCtrlTick();                               // Function for periodic execution of the control thread
+int32_t motorPosition = 0;                          // Current motor position
+int32_t distanceToTarget = 0;                       // Distance to reach desired position
+Mutex distanceToTarget_mutex;                       // Mutex for distanceToTarget
+int32_t setVel = 0;                                 // Desired spin speed
+Mutex setVel_mutex;                                 // Mutex for setVel
+int8_t lead = 2;                                    // Spin direction: 2 for forwards, -2 for backwards
+float PWMPeriod = 2000;                             // PWM period
+float motorPower = 0;                               // Instantaneous desired motor power (pulse width)
+int kp = 35;                                        // Controller var
+int kd = 20;                                        // Controller var
 
-int32_t motorPosition = 0;
-int32_t distanceToTarget = 0;
-Mutex distanceToTarget_mutex;
-int32_t setVel = 6*50;
-Mutex setVel_mutex;
-void motorCtrlTick();
-
-
-void commOutFn();                               // main function in serial communication thread
-void putMessage(uint8_t code, uint32_t data);   // output message to serial comm
-
-void commDecFn();                               // main function in commands decoding thread
-void decodeV(char data[], int size);            // decode velocity messages
-void decodeR(char data[], int size);
-void decodeK(char data[], int size);
-void mine();
-
-//
-volatile uint64_t newKey = 0;
-Mutex newKey_mutex;
-
-typedef struct{                     // Struct used to send data to serial
+void commOutFn();                                   // Main function in serial communication thread
+void putMessage(uint8_t code, uint32_t data);       // Output message to serial comm
+typedef struct{                                     // Struct used to send data to serial
     uint8_t code;
     uint32_t data;
 } message_t ;
-Mail<message_t,16> outMessages;     // Mail to send data to serial from any thread
+Mail<message_t,16> outMessages;                     // Mail to send data to serial from any thread
+RawSerial pc(SERIAL_TX, SERIAL_RX);                 // Serial instantiation
 
-Queue<void, 8> inCharQ;             // Queue for incomming characters
+void commDecFn();                                   // Main function in command decoding thread
+Queue<void, 8> inCharQ;                             // Queue for incomming characters
+void decodeV(char data[], int size);                // Decode velocity messages
+void decodeR(char data[], int size);                // Decode rotation messages
+void decodeK(char data[], int size);                // Decode bitcoin key messages
 
-// Serial instantiation
-RawSerial pc(SERIAL_TX, SERIAL_RX);
+void mine();                                        // Function for bitcoin mining
+volatile uint64_t newKey = 0;                       // Desired mining key
+Mutex newKey_mutex;                                 // Mutex for newKey
 
-//Main
+int sgn(int val);                                   // Get the sign of an integer, returns +/-1
+float max(float a, float b);                        // Return the maximum of two floats
+float min(float a, float b);                        // Return the minimum of two floats
+
+// Main loop************************************************************************************
 int main() {
 
-    // Start threads ****************************************************************************************
-    // Start communication with the terminal thread
-    commOutT.start(commOutFn);
-    // Start commands decoding thread
-    commDec.start(commDecFn);
+    // Start threads
+    commOutT.start(commOutFn);              // Communication with the terminal thread
+    commDec.start(commDecFn);               // Commands decoding thread
     
+    // Set the desired PWM period
     setPWMperiod(PWMPeriod);
+
+    // Synchronisation routine
     orState = motorHome();
 
     // Set the interrupts to the corresponding pins
@@ -138,66 +134,70 @@ int main() {
     // Start motor control thread;
     motorCtrlT.start(motorCtrlFn);
 
-    // Modify main thread priority to low
-    //osThreadSetPriority(osThreadGetId(), osPriorityLow);
-
     // Send ready code
     putMessage(99, 1);
-    //photoInterrupt();
-
+    
+    // Start mining
     mine();
-
 }
 
+// Interrupt routine
 void photoInterrupt(){
-    static int8_t oldRotorState;
-    int8_t rotorState = readRotorState();
+    static int8_t oldRotorState;                // Previous rotor state
+    int8_t rotorState = readRotorState();       // Updated rotor state
     
-
+    // Update the motor pwm's according to the motor power
     motorOut((rotorState-orState+lead+6)%6, motorPower);
+
+    // Update motorPosition according to the specific disk rotation direction
     if(rotorState - oldRotorState == 5) motorPosition--;
     else if(rotorState - oldRotorState == -5) motorPosition++;
     else motorPosition += (rotorState - oldRotorState);
+
+    // Save the actual rotor state
     oldRotorState = rotorState;
 }
 
-// Motor control functions ************************************************
+// Motor control functions ****************************************************************
 void motorCtrlFn(){
-    volatile int32_t desiredVel = 0;
-    float measuredVel = 0;
-    float nextMotorPower;
-    float nextMotorPowerS = 0;
-    float nextMotorPowerR = 0;
-    Ticker motorCtrlTicker; 
-    motorCtrlTicker.attach_us(&motorCtrlTick,100000);
-    Timer motorTimer;
-    motorTimer.start();
-    Timer motorTimer2;
+    volatile int32_t desiredVel = 0;                    // Target speed
+    float measuredVel = 0;                              // Measured velocity
+    float nextMotorPowerS = 0;                          // Motor power as required by the speed controller
+    float nextMotorPowerR = 0;                          // Motor power as required by the position controller
+    float nextMotorPower;                               // Final motor power that will be used
+    Ticker motorCtrlTicker;                             // Ticker to control the execution of while(1)
+    motorCtrlTicker.attach_us(&motorCtrlTick,100000);   // Interrupt to be triggered every 0.1 s
+    Timer motorTimer;                                   // Timer to calculate the motor speed
+    Timer motorTimer2;                                  // Timer to calculate the position rate of change
+    int8_t timeReportCounter = 0;                       // Counter to report speed every x counts
+    int oldDistanceToTarget = distanceToTarget;         // Used to compute the rate of change of the position
+    int32_t motorPositionTemp;                          // Localy store motorPosition (thread safe)
+
+    // Start the timers
     motorTimer2.start();
-    int8_t timeReportCounter = 0;
-    float pastVel1 = 0;
-    float pastVel2 = 0;
-    int oldDistanceToTarget = distanceToTarget;
-    int32_t motorPositionTemp;
-    int nearPos = 0;
+    motorTimer.start();
+
+    // Start the main loop
     while(1){
 
-        // Check speed update message
+        // Wait for ticker interrupt
+        motorCtrlT.signal_wait(0x1);
+
+        // Store target speed locally
         setVel_mutex.lock();
         desiredVel = setVel;
         setVel_mutex.unlock();
 
-        //wait_us(50000);
-        motorCtrlT.signal_wait(0x1);
+        // Get the current motor position
         motorPositionTemp = motorPosition;
+
+        // Calculate current motor speed (times 6)
         measuredVel = motorPositionTemp/motorTimer.read();
         motorTimer.reset();
-        //pastVel2 = pastVel1;
-        //pastVel1 = measuredVel;
 
+        // If the motor is not spining, and the distance to the target is non zero, start themotor
         if(measuredVel == 0 && abs(distanceToTarget)>0){
             photoInterrupt();
-            nearPos = 0;
         }
 
         // Update error
@@ -218,10 +218,6 @@ void motorCtrlFn(){
 
         if(fabs(distanceToTarget) < 6){
             nextMotorPower = 0;
-            if(nearPos != 1){
-                putMessage(50, abs(distanceToTarget));
-                nearPos = 1;
-            }
             distanceToTarget = 0;
             
         }
