@@ -57,13 +57,9 @@ PwmOut L3L(L3Lpin);
 DigitalOut L3H(L3Hpin);
 
 // Threads
-Thread motorCtrlT(osPriorityNormal, 1024);  // Thread to control the speed and position of the motor
-Thread commOutT(osPriorityNormal, 1024);    // Thread used for outgoing communications to serial
-Thread commDec(osPriorityNormal, 2048);     // Thread to decode incoming regex instructions
-
-
-// Function prototypes and global variables
-
+Thread motorCtrlT(osPriorityNormal, 1024);          // Thread to control the speed and position of the motor
+Thread commOutT(osPriorityNormal, 1024);            // Thread used for outgoing communications to serial
+Thread commDec(osPriorityNormal, 2048);             // Thread to decode incoming regex instructions
 
 //Function prototypes and global variables
 void photoInterrupt();                              // Function which handles the photo interrupts
@@ -174,9 +170,9 @@ void motorCtrlFn(){
     int32_t motorPositionTemp;                          // Localy store motorPosition (thread safe)
 
     // Start the timers
-    motorTimer2.start();
     motorTimer.start();
-
+    motorTimer2.start();
+    
     // Start the main loop
     while(1){
 
@@ -200,53 +196,59 @@ void motorCtrlFn(){
             photoInterrupt();
         }
 
-        // Update error
+        // Update the distance to the target
         distanceToTarget -= motorPositionTemp;
         //putMessage(4, distanceToTarget);
         //putMessage(5, distanceToTarget);
 
+        // Compute speed and rotation controllers
         nextMotorPowerS = kp*(desiredVel - fabs(measuredVel))*sgn(distanceToTarget);
         nextMotorPowerR = kp*distanceToTarget+kd*(distanceToTarget-oldDistanceToTarget)/motorTimer2.read();
         motorTimer2.reset();
+
+        // Save the disance to the target
         oldDistanceToTarget = distanceToTarget;
 
-        if(distanceToTarget<0){
+        // Pick the correct controller
+        if(distanceToTarget < 0){
             nextMotorPower = max(nextMotorPowerR, nextMotorPowerS);
         } else {
             nextMotorPower = min(nextMotorPowerR, nextMotorPowerS);
         }
 
+        // If the disc is less than one rotation of the end position, stop
         if(fabs(distanceToTarget) < 6){
             nextMotorPower = 0;
             distanceToTarget = 0;
-            
         }
 
-
+        // If the motor power is negative, turn in the opposit direction
         if(nextMotorPower < 0){
             lead = -2;
             nextMotorPower = fabs(nextMotorPower);
         } else {
             lead = 2;
         }
+
+        // If the motor power exceeds half the PWM duty cycle, limit it
         if(fabs(nextMotorPower)>1000){
             nextMotorPower=1000;
         }
+
+        // Set the motor power
         motorPower = nextMotorPower;
         
+        // Reset the motor position counter
         motorPosition = 0;
         
+        // Report the time every two second (debugging)
         if(timeReportCounter++ == 19){
             if(measuredVel != 0 ){
                 putMessage(10, measuredVel/6);
             }
-            
-            //putMessage(10, distanceToTarget);
+
             timeReportCounter = 0;
         }
-        
-        //
-
     }
 }
 
@@ -283,28 +285,68 @@ void motorOut(int8_t driveState, uint32_t torque){
     if (driveOut & 0x20) L3H = 0;
 }
 
+
+// Set the PWM period
 void setPWMperiod(float period){
     L1L.period_us(period);
     L2L.period_us(period);
     L3L.period_us(period);
 }
 
+// Ticker for the motor control thread
 void motorCtrlTick(){motorCtrlT.signal_set(0x1);}
 
+// Get the current rotor state
 inline int8_t readRotorState(){
     return stateMap[I1 + 2*I2 + 4*I3];
 }
 
+// Thread function for serial communication
 void commOutFn(){
     while(1) {
         osEvent newEvent = outMessages.get();
         message_t *pMessage = (message_t*)newEvent.value.p;
-        pc.printf("Message %d with data 0x%016x\r\n",
-        pMessage->code,pMessage->data);
+        switch(pMessage->code){
+            case 10 : {
+                pc.printf("The current speed is %u rotations per second\r\n", pMessage->data/6);
+                break;
+            }
+            case 81 : {
+                pc.printf("Set to %u rotations per second\r\n", pMessage->data/6);
+                break;
+            }
+            case 82 : {
+                pc.printf("Do %u rotations\r\n", pMessage->data/6);
+                break;
+            }
+            case 83 : {
+                pc.printf("Key set to %16x", pMessage->data);
+                break;
+            }
+            case 84 : {
+                pc.printf("%16x\r\n", pMessage->data);
+                break;
+            }
+            case 90 : {
+                pc.printf("Hash found with key 0x%x", pMessage->data);
+                break;
+            }
+            case 91 : {
+                pc.printf(" and nonce %x\r\n", pMessage->data);
+                break;
+            }
+            case 99 : {
+                pc.printf("Ready!\r\n");
+                break;
+            }
+            default : pc.printf("Message %d with data 0x%016x\r\n",
+                        pMessage->code,pMessage->data);
+        }
         outMessages.free(pMessage);
     }
 }
 
+// Send a message to the serial
 void putMessage(uint8_t code, uint32_t data){
     message_t *pMessage = outMessages.alloc();
     pMessage->code = code;
@@ -323,30 +365,38 @@ void commDecFn(){
 
     // inCommPtr stores the next empty index in inComm array (stores incomming message from serial)
     int inCommPtr = 0;
+    // Maximum incomming command length
     const int textBufferSize = 30;
+    // Command received
     char inComm[textBufferSize];
 
     while(1){
-            osEvent newEvent = inCharQ.get();
-            uint8_t newChar = (uint8_t) newEvent.value.p;
+        // Get the next character
+        osEvent newEvent = inCharQ.get();
+        uint8_t newChar = (uint8_t) newEvent.value.p;
+        // If not carriage return, save to array, else decode
         if(newChar != (char)'\r'){
             inComm[inCommPtr++] = newChar;
         }else{
+            // End the command received array
             inComm[inCommPtr++] = (char)'\0';
             inCommPtr = 0;
             // Decode command
             if(inComm[0] == (char)'R') decodeR(inComm, textBufferSize);
             if(inComm[0] == (char)'V') decodeV(inComm, textBufferSize);
-            if(inComm[0] == (char)'K') decodeK(inComm, textBufferSize);//decodeK();
+            if(inComm[0] == (char)'K') decodeK(inComm, textBufferSize);
         }
         if(inCommPtr == 30){
-            inCommPtr = 0;
+            // If the message is too long, overwrite the command received and store in the 
+            // first position an E (decode functions will never get triggered)
+            inComm[0] = (char)'E';
+            inCommPtr = 1;
         }   
     }
 }
 
+// Decode speed message
 void decodeV(char data[], int size){
-    //Decode velocity
     int32_t newVel;
     sscanf(data, "V%u", &newVel);
     newVel = newVel*6;
@@ -357,22 +407,24 @@ void decodeV(char data[], int size){
     setVel_mutex.lock();
     setVel = newVel;
     setVel_mutex.unlock();
-    /*int32_t *velMessage = newVel_Mail.alloc();
-    *velMessage = newVel;
-    newVel_Mail.put(velMessage);*/
+    
+    // Print desired speed
+    putMessage(81, newVel);
 }
 
+// Decode position message
 void decodeR(char data[], int size){
-    //Decode velocity
+
     int32_t newTarget;
     sscanf(data, "R%u", &newTarget);
     if(newTarget != 0){
         newTarget = newTarget*6 + orState;
     } else {
+        // Set max speed
         newTarget = 2147483647;
     }
     
-    putMessage(6, newTarget);
+    putMessage(82, newTarget);
     distanceToTarget_mutex.lock();
     distanceToTarget = (int32_t) newTarget;
     distanceToTarget_mutex.unlock();
@@ -380,33 +432,16 @@ void decodeR(char data[], int size){
 
 void decodeK(char data[], int size){
      
-     uint64_t tempInt1 = 0;
-     uint32_t  tempInt2 = 0;
-     //uint64_t finalKey = 0;
-     //sscanf(inComm, "K%llx", &newKey);
-     /*uint8_t* tempPtr = (uint8_t*) &newKey;
-     
-     for(int i = 0; i < 16; i = i + 2){
-         
-         sscanf(&data[16-i], "%1x", &tempInt1);
-         sscanf(&data[15-i], "%1x", &tempInt2);
-         *tempPtr = (uint8_t)(tempInt2 << 4 | tempInt1);
-         tempPtr++;
-     }*/
-     sscanf(data, "K%8x", &tempInt1);
-     sscanf(data+9, "%8x", &tempInt2);
-     //sscanf(data+36, "%8x", &newKey+32);
-     //pc.printf("%16x", tempInt1);
-     newKey_mutex.lock();
-     newKey = tempInt1 << 32 | tempInt2;
-     newKey_mutex.unlock();
-     //putMessage(76, tempInt1);
-     //putMessage(76, tempInt2);
-    //pc.printf("%16x", finalKey);
-     //newKey_mutex.lock();
-     //newKey = (uint64_t)(tempInt1 << 32 | tempInt2);
-     //newKey_mutex.unlock();
-     //putMessage(76, newKey);
+    uint64_t tempInt1 = 0;
+    uint32_t  tempInt2 = 0;
+    sscanf(data, "K%8x", &tempInt1);
+    sscanf(data+9, "%8x", &tempInt2);
+    newKey_mutex.lock();
+    newKey = tempInt1 << 32 | tempInt2;
+    newKey_mutex.unlock();
+    putMessage(83, tempInt1);
+    putMessage(84, tempInt2);
+    
  }
 
 
