@@ -206,9 +206,6 @@ void motorCtrlFn(){
             photoInterrupt();
         }
 
-        //putMessage(4, distanceToTarget);
-        //putMessage(5, distanceToTarget);
-
         // Compute speed and rotation controllers
         nextMotorPowerS = kp*(desiredVel - fabs(measuredVel))*sgn(distanceToTargetTemp);
         nextMotorPowerR = kp*distanceToTargetTemp+kd*(distanceToTargetTemp-oldDistanceToTarget)/motorTimer2.read();
@@ -512,7 +509,7 @@ void mine(){
     
     //Crypto
     SHA256 crypt;
-    //rial pc2(SERIAL_TX, SERIAL_RX);
+
     uint8_t sequence[] = {0x45,0x6D,0x62,0x65,0x64,0x64,0x65,0x64,
     0x20,0x53,0x79,0x73,0x74,0x65,0x6D,0x73,
     0x20,0x61,0x72,0x65,0x20,0x66,0x75,0x6E,
@@ -528,18 +525,15 @@ void mine(){
     uint32_t hashCount = 0;
     Timer t;
     t.start();
-    //deb.start();
+
     while (1) {
         
-        //putMessage(90, 1);
         newKey_mutex.lock();
         *key = newKey;
         newKey_mutex.unlock();
 
-        //*key = 0;
         crypt.computeHash(hash, sequence, 64);
 
-        //pc.printf("%d\n\r", nonce);
         if(hash[0] == 0 && hash[1] == 0){
             putMessage(90, *((uint32_t*)key+1));
             putMessage(91, *((uint32_t*)key));
