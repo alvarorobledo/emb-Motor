@@ -2,6 +2,8 @@
     "C_Cpp.intelliSenseEngineFallback": "Enabled",
     "C_Cpp.errorSquiggles": "Disabled",
     "files.associations": {
-        "xstddef": "cpp"
+        "xstddef": "cpp",
+        "initializer_list": "cpp",
+        "type_traits": "cpp"
     }
 }

@@ -106,12 +106,14 @@ int sgn(int val);                                   // Get the sign of an intege
 float max(float a, float b);                        // Return the maximum of two floats
 float min(float a, float b);                        // Return the minimum of two floats
 
+Timer deb;
+    
 // Main loop************************************************************************************
 int main() {
 
     // Start threads
     commOutT.start(commOutFn);              // Communication with the terminal thread
-    commDec.start(commDecFn);               // Commands decoding thread
+    commDec.start(commDecFn);               // Commands decoding thread 
     
     // Set the desired PWM period
     setPWMperiod(PWMPeriod);
@@ -128,7 +130,7 @@ int main() {
     I3.fall(&photoInterrupt);
 
     // Start motor control thread;
-    motorCtrlT.start(motorCtrlFn);
+    //motorCtrlT.start(motorCtrlFn);
 
     // Send ready code
     putMessage(99, 1);
@@ -166,8 +168,9 @@ void motorCtrlFn(){
     Timer motorTimer;                                   // Timer to calculate the motor speed
     Timer motorTimer2;                                  // Timer to calculate the position rate of change
     int8_t timeReportCounter = 0;                       // Counter to report speed every x counts
-    int oldDistanceToTarget = distanceToTarget;         // Used to compute the rate of change of the position
+    int32_t oldDistanceToTarget;                        // Used to compute the rate of change of the position
     int32_t motorPositionTemp;                          // Localy store motorPosition (thread safe)
+    int32_t distanceToTargetTemp;                       // Localy store distanceToTarget
 
     // Start the timers
     motorTimer.start();
@@ -175,7 +178,7 @@ void motorCtrlFn(){
     
     // Start the main loop
     while(1){
-
+        
         // Wait for ticker interrupt
         motorCtrlT.signal_wait(0x1);
 
@@ -191,35 +194,40 @@ void motorCtrlFn(){
         measuredVel = motorPositionTemp/motorTimer.read();
         motorTimer.reset();
 
-        // If the motor is not spining, and the distance to the target is non zero, start themotor
-        if(measuredVel == 0 && abs(distanceToTarget)>0){
+        // Mutex for distanceToTarget
+        distanceToTarget_mutex.lock();
+        distanceToTarget -= motorPositionTemp;      // Update the distance to the target
+        distanceToTargetTemp = distanceToTarget;
+        distanceToTarget_mutex.unlock();
+
+        // If the motor is not spining, and the distance to the target is non zero, start the motor
+        if(measuredVel == 0 && abs(distanceToTargetTemp)>0){
+            oldDistanceToTarget = distanceToTargetTemp;
             photoInterrupt();
         }
 
-        // Update the distance to the target
-        distanceToTarget -= motorPositionTemp;
         //putMessage(4, distanceToTarget);
         //putMessage(5, distanceToTarget);
 
         // Compute speed and rotation controllers
-        nextMotorPowerS = kp*(desiredVel - fabs(measuredVel))*sgn(distanceToTarget);
-        nextMotorPowerR = kp*distanceToTarget+kd*(distanceToTarget-oldDistanceToTarget)/motorTimer2.read();
+        nextMotorPowerS = kp*(desiredVel - fabs(measuredVel))*sgn(distanceToTargetTemp);
+        nextMotorPowerR = kp*distanceToTargetTemp+kd*(distanceToTargetTemp-oldDistanceToTarget)/motorTimer2.read();
         motorTimer2.reset();
 
         // Save the disance to the target
-        oldDistanceToTarget = distanceToTarget;
+        oldDistanceToTarget = distanceToTargetTemp;
 
         // Pick the correct controller
-        if(distanceToTarget < 0){
+        if(distanceToTargetTemp < 0){
             nextMotorPower = max(nextMotorPowerR, nextMotorPowerS);
         } else {
             nextMotorPower = min(nextMotorPowerR, nextMotorPowerS);
         }
 
         // If the disc is less than one rotation of the end position, stop
-        if(fabs(distanceToTarget) < 6){
+        if(abs(distanceToTargetTemp) < 6){
             nextMotorPower = 0;
-            distanceToTarget = 0;
+            distanceToTargetTemp = 0;
         }
 
         // If the motor power is negative, turn in the opposit direction
@@ -244,11 +252,12 @@ void motorCtrlFn(){
         // Report the time every two second (debugging)
         if(timeReportCounter++ == 19){
             if(measuredVel != 0 ){
-                putMessage(10, measuredVel/6);
+                putMessage(10, measuredVel);
             }
 
             timeReportCounter = 0;
         }
+        
     }
 }
 
@@ -320,11 +329,11 @@ void commOutFn(){
                 break;
             }
             case 83 : {
-                pc.printf("Key set to %16x", pMessage->data);
+                pc.printf("Key set to %x", pMessage->data);
                 break;
             }
             case 84 : {
-                pc.printf("%16x\r\n", pMessage->data);
+                pc.printf("%x\r\n", pMessage->data);
                 break;
             }
             case 90 : {
@@ -332,17 +341,26 @@ void commOutFn(){
                 break;
             }
             case 91 : {
-                pc.printf(" and nonce %x\r\n", pMessage->data);
+                pc.printf("%x", pMessage->data);
+                break;
+            }
+            case 92 : {
+                pc.printf(" and nonce 0x%x\r\n", pMessage->data);
                 break;
             }
             case 99 : {
                 pc.printf("Ready!\r\n");
                 break;
             }
+            case 100 : {
+                pc.printf("Timer: %d\r\n", pMessage->data);
+                break;
+            }
             default : pc.printf("Message %d with data 0x%016x\r\n",
                         pMessage->code,pMessage->data);
         }
         outMessages.free(pMessage);
+        
     }
 }
 
@@ -373,6 +391,7 @@ void commDecFn(){
     while(1){
         // Get the next character
         osEvent newEvent = inCharQ.get();
+        
         uint8_t newChar = (uint8_t) newEvent.value.p;
         // If not carriage return, save to array, else decode
         if(newChar != (char)'\r'){
@@ -398,7 +417,7 @@ void commDecFn(){
 // Decode speed message
 void decodeV(char data[], int size){
     int32_t newVel;
-    sscanf(data, "V%u", &newVel);
+    sscanf(data, "V%d", &newVel);
     newVel = newVel*6;
     if(newVel == 0){
         newVel = 2000;
@@ -416,7 +435,7 @@ void decodeV(char data[], int size){
 void decodeR(char data[], int size){
 
     int32_t newTarget;
-    sscanf(data, "R%u", &newTarget);
+    sscanf(data, "R%d", &newTarget);
     if(newTarget != 0){
         newTarget = newTarget*6 + orState;
     } else {
@@ -424,7 +443,7 @@ void decodeR(char data[], int size){
         newTarget = 2147483647;
     }
     
-    putMessage(82, newTarget);
+    putMessage(82, newTarget-orState);
     distanceToTarget_mutex.lock();
     distanceToTarget = (int32_t) newTarget;
     distanceToTarget_mutex.unlock();
@@ -472,6 +491,7 @@ float min(float a, float b){
 }
 
 void mine(){
+    
     //Crypto
     SHA256 crypt;
     //rial pc2(SERIAL_TX, SERIAL_RX);
@@ -487,25 +507,33 @@ void mine(){
     uint64_t* nonce = (uint64_t*)((int)sequence + 56);
     uint8_t hash[32];
     
-    uint8_t hashCount = 0;
+    uint32_t hashCount = 0;
     Timer t;
-    
 
     while (1) {
+        
         t.start();
         //putMessage(90, 1);
-        newKey_mutex.lock();
+        /*newKey_mutex.lock();
         *key = newKey;
-        newKey_mutex.unlock();
+        newKey_mutex.unlock();*/
         //*key = 0;
         crypt.computeHash(hash, sequence, 64);
 
-        *nonce = *nonce + 1;
+        
         //pc.printf("%d\n\r", nonce);
         if(hash[0] == 0 && hash[1] == 0){
-            putMessage(90, *key);
-            putMessage(91, *nonce);
-            hashCount++;
+            putMessage(90, *((uint32_t*)key+1));
+            putMessage(91, *((uint32_t*)key));
+            putMessage(92, *nonce);
+            
+        }
+        *nonce = *nonce + 1;
+        hashCount++;
+        if(t.read() > 10){
+            putMessage(100, hashCount);
+            hashCount = 0;
+            t.reset();
         }
         //t.stop();
         // if(t.read() > 1){
