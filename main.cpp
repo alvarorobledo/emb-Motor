@@ -130,7 +130,7 @@ int main() {
     I3.fall(&photoInterrupt);
 
     // Start motor control thread;
-    //motorCtrlT.start(motorCtrlFn);
+    motorCtrlT.start(motorCtrlFn);
 
     // Send ready code
     putMessage(99, 1);
@@ -143,7 +143,7 @@ int main() {
 void photoInterrupt(){
     static int8_t oldRotorState;                // Previous rotor state
     int8_t rotorState = readRotorState();       // Updated rotor state
-    
+
     // Update the motor pwm's according to the motor power
     motorOut((rotorState-orState+lead+6)%6, motorPower);
 
@@ -249,7 +249,7 @@ void motorCtrlFn(){
         // Reset the motor position counter
         motorPosition = 0;
         
-        // Report the time every two second (debugging)
+        // Report the time every two seconds
         if(timeReportCounter++ == 19){
             if(measuredVel != 0 ){
                 putMessage(10, measuredVel);
@@ -321,11 +321,21 @@ void commOutFn(){
                 break;
             }
             case 81 : {
-                pc.printf("Set to %u rotations per second\r\n", pMessage->data/6);
+                if(pMessage->data == 2000){
+                    pc.printf("Rotate as fast as possible\r\n");
+                } else {
+                    pc.printf("Set to %u rotations per second\r\n", pMessage->data/6);
+                }
                 break;
             }
             case 82 : {
-                pc.printf("Do %u rotations\r\n", pMessage->data/6);
+                if(((int) pMessage->data) > 0){
+                    pc.printf("Do %u rotations\r\n", pMessage->data/6);
+                } else if(((int) pMessage->data) < 0){
+                    pc.printf("Do -%u rotations\r\n", -1*pMessage->data/6);
+                } else {
+                    pc.printf("Rotate forever\r\n");
+                }
                 break;
             }
             case 83 : {
@@ -354,6 +364,10 @@ void commOutFn(){
             }
             case 100 : {
                 pc.printf("Timer: %d\r\n", pMessage->data);
+                break;
+            }
+            case 101 : {
+                pc.printf("Hash rate: %d\r\n", pMessage->data);
                 break;
             }
             default : pc.printf("Message %d with data 0x%016x\r\n",
@@ -438,12 +452,16 @@ void decodeR(char data[], int size){
     sscanf(data, "R%d", &newTarget);
     if(newTarget != 0){
         newTarget = newTarget*6 + orState;
+        putMessage(82, newTarget-orState);
     } else {
-        // Set max speed
-        newTarget = 2147483647;
+        if(data[1] == '-'){
+            newTarget = -2147483647;
+        } else {
+            newTarget = 2147483647;
+        }
+        putMessage(82, 0);
     }
     
-    putMessage(82, newTarget-orState);
     distanceToTarget_mutex.lock();
     distanceToTarget = (int32_t) newTarget;
     distanceToTarget_mutex.unlock();
@@ -509,18 +527,18 @@ void mine(){
     
     uint32_t hashCount = 0;
     Timer t;
-
+    t.start();
+    //deb.start();
     while (1) {
         
-        t.start();
         //putMessage(90, 1);
-        /*newKey_mutex.lock();
+        newKey_mutex.lock();
         *key = newKey;
-        newKey_mutex.unlock();*/
+        newKey_mutex.unlock();
+
         //*key = 0;
         crypt.computeHash(hash, sequence, 64);
 
-        
         //pc.printf("%d\n\r", nonce);
         if(hash[0] == 0 && hash[1] == 0){
             putMessage(90, *((uint32_t*)key+1));
@@ -530,17 +548,10 @@ void mine(){
         }
         *nonce = *nonce + 1;
         hashCount++;
-        if(t.read() > 10){
-            putMessage(100, hashCount);
+        if(t.read() > 60){
+            putMessage(101, hashCount/t.read());
             hashCount = 0;
             t.reset();
-        }
-        //t.stop();
-        // if(t.read() > 1){
-        //     t.reset();
-        //     pc2.printf("%d\n\r", hashCount);
-        //     hashCount = 0;
-        // }
-        //t.start()
+        }        
     }
 }
